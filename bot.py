@@ -11,7 +11,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 # ==========================================
 API_ID = "20288994" # REMINDER: Keep these secret in production!
 API_HASH = "d702614912f1ad370a0d18786002adbf"
-BOT_TOKEN = "8610998423:AAGAneW7hmfW8kUP_FUCXjjb_jl5_BQXUQA"
+BOT_TOKEN = "8705984680:AAHibptYauF33lFmTeACKqFDwTjIo13jPBY"
 
 app = Client(
     "converter_bot",
