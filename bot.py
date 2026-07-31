@@ -10,6 +10,7 @@ import aiohttp
 from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.errors import FloodWait
 
 try:
     import uvloop
@@ -55,6 +56,7 @@ DOWNLOAD_CONNECTIONS = 8  # [OPTIMIZATION] parallel segments for /leech
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 ACTIVE_TASKS = {}          # task_id -> task dict
 SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
+PROGRESS_UPDATE_INTERVAL = 3  # seconds between live-card edits — avoids Telegram flood limits
 
 START_TIME = time.time()
 
@@ -162,15 +164,26 @@ def render_card(task):
 
 async def push_update(task, force=False):
     now = time.time()
-    if not force and now - task.get('last_edit', 0) < 2:
+    if not force and now - task.get('last_edit', 0) < PROGRESS_UPDATE_INTERVAL:
+        return
+    # Guard against overlapping edits — if a previous edit_text call for
+    # this task is still in flight, skip rather than stacking another one.
+    if task.get('edit_in_flight'):
         return
     task['last_edit'] = now
+    task['edit_in_flight'] = True
     try:
         await task['status_msg'].edit_text(
             render_card(task), reply_markup=refresh_markup(task['id'])
         )
+    except FloodWait as e:
+        # Telegram is rate-limiting edits for this chat/bot — back off for
+        # the required time instead of raising inside a fire-and-forget task.
+        task['last_edit'] = now + e.value
     except Exception:
         pass
+    finally:
+        task['edit_in_flight'] = False
 
 @app.on_callback_query(filters.regex(r"^refresh\|"))
 async def refresh_cb(client, cq):
@@ -364,6 +377,13 @@ async def run_ffmpeg_with_progress(cmd, duration, task):
 # DOWNLOAD: TELEGRAM MESSAGE (with task card)
 # ==========================================
 async def tg_progress(current, total, task):
+    # pyrogram calls this on EVERY chunk received — for a large file that
+    # can be thousands of calls per second. Always update the raw numbers
+    # (cheap, in-memory), but only ever let push_update actually try a
+    # Telegram edit; push_update itself enforces the cooldown + in-flight
+    # guard, so most of these calls are near-free no-ops. This prevents
+    # the flood of concurrent edit_text calls that was starving/stalling
+    # the download itself.
     task['processed'] = current
     task['total'] = total or task.get('total', 0)
     await push_update(task)
@@ -672,18 +692,30 @@ async def handle_file(client, message):
 
     async def source_fn(inp, task):
         task['total'] = file_size
-        await message.download(
-            file_name=inp,
-            progress=lambda cur, tot: asyncio.create_task(tg_progress(cur, tot, task))
-        )
-        # Telegram downloads can also end early on connection hiccups —
-        # verify we actually got the full file before converting.
-        actual_size = os.path.getsize(inp) if os.path.exists(inp) else 0
-        if file_size and actual_size != file_size:
-            raise RuntimeError(
-                f"Telegram download incomplete: got {actual_size} bytes, "
-                f"expected {file_size} bytes."
-            )
+        retries = 3
+        last_err = None
+        for attempt in range(1, retries + 1):
+            task['processed'] = 0
+            if os.path.exists(inp):
+                os.remove(inp)
+            try:
+                await message.download(
+                    file_name=inp,
+                    progress=lambda cur, tot: asyncio.create_task(tg_progress(cur, tot, task))
+                )
+                actual_size = os.path.getsize(inp) if os.path.exists(inp) else 0
+                if file_size and actual_size != file_size:
+                    raise RuntimeError(
+                        f"Telegram download incomplete: got {actual_size} bytes, "
+                        f"expected {file_size} bytes."
+                    )
+                return
+            except Exception as e:
+                last_err = e
+                if attempt < retries and not task.get('cancelled'):
+                    await asyncio.sleep(2 * attempt)  # backoff before retrying
+                    continue
+                raise last_err
 
     await run_task(client, message, file_name, "📦 Telegram File", source_fn, ext)
 
