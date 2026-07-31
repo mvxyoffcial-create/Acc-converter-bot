@@ -374,13 +374,50 @@ async def tg_progress(current, total, task):
 async def _download_range(session, url, start, end, dest_path, task):
     headers = {"Range": f"bytes={start}-{end}"}
     async with session.get(url, headers=headers) as resp:
-        resp.raise_for_status()
+        # CRITICAL: a server can advertise Accept-Ranges: bytes and still
+        # ignore the Range header on a given request (redirects, proxies,
+        # some CDNs/object stores) and return the FULL file with a 200.
+        # If we don't check this, every parallel segment writes the entire
+        # file at its own offset and the output is silently corrupted —
+        # this is what was producing "moov atom not found" / partial output.
+        if resp.status != 206:
+            raise RuntimeError(
+                f"Server did not honor Range request (status {resp.status}); "
+                "falling back to single-stream download."
+            )
+        content_range = resp.headers.get("Content-Range", "")
+        if content_range and f"bytes {start}-{end}" not in content_range:
+            raise RuntimeError(
+                f"Server returned unexpected Content-Range '{content_range}' "
+                f"for requested bytes {start}-{end}; aborting segmented download."
+            )
         with open(dest_path, "r+b") as f:
             f.seek(start)
+            written = 0
+            async for chunk in resp.content.iter_chunked(1024 * 1024):
+                f.write(chunk)
+                written += len(chunk)
+                task['processed'] += len(chunk)
+                await push_update(task)
+            expected = end - start + 1
+            if written != expected:
+                raise RuntimeError(
+                    f"Segment {start}-{end} incomplete: got {written} of "
+                    f"{expected} bytes."
+                )
+
+async def _download_single_stream(session, url, dest_path, task):
+    task['processed'] = 0
+    async with session.get(url) as resp:
+        resp.raise_for_status()
+        total = task.get('total') or int(resp.headers.get('Content-Length', 0))
+        task['total'] = total
+        with open(dest_path, 'wb') as f:
             async for chunk in resp.content.iter_chunked(1024 * 1024):
                 f.write(chunk)
                 task['processed'] += len(chunk)
                 await push_update(task)
+    return task['processed']
 
 async def download_from_url(url, dest_path, task):
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=60)
@@ -395,7 +432,9 @@ async def download_from_url(url, dest_path, task):
         task['total'] = total
 
         # [OPTIMIZATION] segmented parallel download when the server
-        # supports Range requests and the file is big enough to benefit
+        # supports Range requests and the file is big enough to benefit.
+        # Falls back to a clean single-stream download if the server
+        # doesn't actually honor Range requests (validated per-segment).
         if accepts_ranges and total > 5 * 1024 * 1024:
             with open(dest_path, "wb") as f:
                 f.truncate(total)
@@ -407,24 +446,32 @@ async def download_from_url(url, dest_path, task):
                 end = total - 1 if i == DOWNLOAD_CONNECTIONS - 1 else start + chunk_size - 1
                 ranges.append((start, end))
 
-            await asyncio.gather(*[
-                _download_range(session, url, start, end, dest_path, task)
-                for start, end in ranges
-            ])
+            task['processed'] = 0
+            try:
+                await asyncio.gather(*[
+                    _download_range(session, url, start, end, dest_path, task)
+                    for start, end in ranges
+                ])
+            except Exception:
+                # Segmented download failed or was corrupted — restart clean
+                # with a plain single-stream download rather than uploading
+                # a broken file.
+                await _download_single_stream(session, url, dest_path, task)
         else:
-            # fallback: single-stream download
-            async with session.get(url) as resp:
-                resp.raise_for_status()
-                if not total:
-                    total = int(resp.headers.get('Content-Length', 0))
-                    task['total'] = total
-                with open(dest_path, 'wb') as f:
-                    async for chunk in resp.content.iter_chunked(1024 * 1024):
-                        f.write(chunk)
-                        task['processed'] += len(chunk)
-                        await push_update(task)
+            await _download_single_stream(session, url, dest_path, task)
 
-    return task['processed']
+    # Final integrity check: if we know the expected size, make sure we
+    # actually got all of it. Catches any remaining partial-download cases
+    # (dropped connections, truncated responses) before we ever hand the
+    # file to ffmpeg.
+    actual_size = os.path.getsize(dest_path)
+    if task.get('total') and actual_size != task['total']:
+        raise RuntimeError(
+            f"Download incomplete: got {actual_size} bytes, "
+            f"expected {task['total']} bytes."
+        )
+
+    return actual_size
 
 def guess_filename_ext(url):
     path = urlparse(url).path
@@ -439,7 +486,19 @@ async def convert_and_upload(client, message, task, inp, out, file_name):
     if task.get('cancelled'):
         return
 
+    # Sanity check the input file before handing it to ffmpeg. If probing
+    # fails entirely, the file is likely corrupt/empty — bail out clearly
+    # instead of letting ffmpeg silently convert a "sample" of it.
+    if not os.path.exists(inp) or os.path.getsize(inp) == 0:
+        raise RuntimeError("Downloaded/received file is empty or missing.")
+
     duration = await get_duration(inp)
+    if duration <= 0:
+        raise RuntimeError(
+            "Could not read a valid duration from the input file — it is "
+            "likely incomplete or corrupted. Please try again."
+        )
+
     s = await get_settings(message.from_user.id)
 
     # [OPTIMIZATION] only downmix if source actually has >2 channels,
@@ -491,6 +550,22 @@ async def convert_and_upload(client, message, task, inp, out, file_name):
         return
 
     out_size = os.path.getsize(out)
+    if out_size == 0:
+        await task['status_msg'].edit_text(
+            "❌ **Conversion produced an empty file.** Please try again."
+        )
+        return
+
+    # Sanity check the output duration matches the input — catches cases
+    # where ffmpeg exits 0 but only wrote a partial stream.
+    out_duration = await get_duration(out)
+    if out_duration > 0 and duration > 0 and out_duration < duration * 0.9:
+        await task['status_msg'].edit_text(
+            f"❌ **Conversion looks incomplete** "
+            f"({format_duration(out_duration)} of {format_duration(duration)} expected). "
+            "Please try again."
+        )
+        return
 
     task['stage'] = "⬆️ Uploading"
     task['processed'] = 0
@@ -601,6 +676,14 @@ async def handle_file(client, message):
             file_name=inp,
             progress=lambda cur, tot: asyncio.create_task(tg_progress(cur, tot, task))
         )
+        # Telegram downloads can also end early on connection hiccups —
+        # verify we actually got the full file before converting.
+        actual_size = os.path.getsize(inp) if os.path.exists(inp) else 0
+        if file_size and actual_size != file_size:
+            raise RuntimeError(
+                f"Telegram download incomplete: got {actual_size} bytes, "
+                f"expected {file_size} bytes."
+            )
 
     await run_task(client, message, file_name, "📦 Telegram File", source_fn, ext)
 
