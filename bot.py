@@ -21,8 +21,6 @@ except ImportError:
 # ==========================================
 # CONFIGURATION
 # ==========================================
-# All secrets come from environment variables — never hardcode credentials
-# in source. Set these on your host (Render dashboard / .env / systemd unit).
 API_ID = 36282056
 API_HASH = "3a948acece533f362b4c90b2b3c14b60"
 BOT_TOKEN = "8850488086:AAHM3lp_bAQvdILvycZ2IDpGawdTGT_bk1M"
@@ -166,8 +164,6 @@ async def push_update(task, force=False):
     now = time.time()
     if not force and now - task.get('last_edit', 0) < PROGRESS_UPDATE_INTERVAL:
         return
-    # Guard against overlapping edits — if a previous edit_text call for
-    # this task is still in flight, skip rather than stacking another one.
     if task.get('edit_in_flight'):
         return
     task['last_edit'] = now
@@ -177,8 +173,6 @@ async def push_update(task, force=False):
             render_card(task), reply_markup=refresh_markup(task['id'])
         )
     except FloodWait as e:
-        # Telegram is rate-limiting edits for this chat/bot — back off for
-        # the required time instead of raising inside a fire-and-forget task.
         task['last_edit'] = now + e.value
     except Exception:
         pass
@@ -306,9 +300,6 @@ async def get_duration(path):
         return 0
 
 async def get_audio_info(path):
-    """Returns (channels, sample_rate). Defaults are conservative (assume
-    surround + mismatched rate) if probing fails, so we don't skip needed
-    processing."""
     try:
         p = await asyncio.create_subprocess_exec(
             'ffprobe', '-v', 'error',
@@ -343,7 +334,7 @@ async def run_ffmpeg_with_progress(cmd, duration, task):
 
     while True:
         try:
-            chunk = await process.stdout.read(65536)  # [OPTIMIZATION] big reads
+            chunk = await process.stdout.read(65536)
             if not chunk:
                 break
 
@@ -377,13 +368,6 @@ async def run_ffmpeg_with_progress(cmd, duration, task):
 # DOWNLOAD: TELEGRAM MESSAGE (with task card)
 # ==========================================
 async def tg_progress(current, total, task):
-    # pyrogram calls this on EVERY chunk received — for a large file that
-    # can be thousands of calls per second. Always update the raw numbers
-    # (cheap, in-memory), but only ever let push_update actually try a
-    # Telegram edit; push_update itself enforces the cooldown + in-flight
-    # guard, so most of these calls are near-free no-ops. This prevents
-    # the flood of concurrent edit_text calls that was starving/stalling
-    # the download itself.
     task['processed'] = current
     task['total'] = total or task.get('total', 0)
     await push_update(task)
@@ -394,12 +378,6 @@ async def tg_progress(current, total, task):
 async def _download_range(session, url, start, end, dest_path, task):
     headers = {"Range": f"bytes={start}-{end}"}
     async with session.get(url, headers=headers) as resp:
-        # CRITICAL: a server can advertise Accept-Ranges: bytes and still
-        # ignore the Range header on a given request (redirects, proxies,
-        # some CDNs/object stores) and return the FULL file with a 200.
-        # If we don't check this, every parallel segment writes the entire
-        # file at its own offset and the output is silently corrupted —
-        # this is what was producing "moov atom not found" / partial output.
         if resp.status != 206:
             raise RuntimeError(
                 f"Server did not honor Range request (status {resp.status}); "
@@ -441,8 +419,6 @@ async def _download_single_stream(session, url, dest_path, task):
 
 async def download_from_url(url, dest_path, task):
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=60)
-    # [OPTIMIZATION] connector limit must cover all parallel segments,
-    # otherwise aiohttp silently queues them and download stops being parallel
     connector = aiohttp.TCPConnector(limit=DOWNLOAD_CONNECTIONS + 2, ttl_dns_cache=300)
     async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         async with session.head(url, allow_redirects=True) as head_resp:
@@ -451,10 +427,6 @@ async def download_from_url(url, dest_path, task):
 
         task['total'] = total
 
-        # [OPTIMIZATION] segmented parallel download when the server
-        # supports Range requests and the file is big enough to benefit.
-        # Falls back to a clean single-stream download if the server
-        # doesn't actually honor Range requests (validated per-segment).
         if accepts_ranges and total > 5 * 1024 * 1024:
             with open(dest_path, "wb") as f:
                 f.truncate(total)
@@ -473,17 +445,10 @@ async def download_from_url(url, dest_path, task):
                     for start, end in ranges
                 ])
             except Exception:
-                # Segmented download failed or was corrupted — restart clean
-                # with a plain single-stream download rather than uploading
-                # a broken file.
                 await _download_single_stream(session, url, dest_path, task)
         else:
             await _download_single_stream(session, url, dest_path, task)
 
-    # Final integrity check: if we know the expected size, make sure we
-    # actually got all of it. Catches any remaining partial-download cases
-    # (dropped connections, truncated responses) before we ever hand the
-    # file to ffmpeg.
     actual_size = os.path.getsize(dest_path)
     if task.get('total') and actual_size != task['total']:
         raise RuntimeError(
@@ -506,9 +471,6 @@ async def convert_and_upload(client, message, task, inp, out, file_name):
     if task.get('cancelled'):
         return
 
-    # Sanity check the input file before handing it to ffmpeg. If probing
-    # fails entirely, the file is likely corrupt/empty — bail out clearly
-    # instead of letting ffmpeg silently convert a "sample" of it.
     if not os.path.exists(inp) or os.path.getsize(inp) == 0:
         raise RuntimeError("Downloaded/received file is empty or missing.")
 
@@ -521,8 +483,6 @@ async def convert_and_upload(client, message, task, inp, out, file_name):
 
     s = await get_settings(message.from_user.id)
 
-    # [OPTIMIZATION] only downmix if source actually has >2 channels,
-    # and only resample if the source rate doesn't already match target
     channels, src_rate = await get_audio_info(inp)
     audio_filters = []
     if channels > 2:
@@ -539,17 +499,17 @@ async def convert_and_upload(client, message, task, inp, out, file_name):
         'ffmpeg', '-y', '-nostdin',
         '-hwaccel', 'auto',
         '-i', inp,
-        '-map', '0:a:0',       # [OPTIMIZATION] only touch the audio stream
+        '-map', '0:a:0',
         '-threads', '0',
         '-c:a', 'aac',
-        '-aac_coder', 'fast',  # [OPTIMIZATION] faster AAC encode path
+        '-aac_coder', 'fast',
         '-b:a', s['bitrate'],
         '-ac', '2',
     ]
     if audio_filters:
         cmd += ['-af', ','.join(audio_filters)]
     if str(src_rate) != str(s['ar']):
-        cmd += ['-ar', s['ar']]  # [OPTIMIZATION] skip resample if rates already match
+        cmd += ['-ar', s['ar']]
     cmd += [
         '-vn',
         '-map_metadata', '0',
@@ -576,8 +536,6 @@ async def convert_and_upload(client, message, task, inp, out, file_name):
         )
         return
 
-    # Sanity check the output duration matches the input — catches cases
-    # where ffmpeg exits 0 but only wrote a partial stream.
     out_duration = await get_duration(out)
     if out_duration > 0 and duration > 0 and out_duration < duration * 0.9:
         await task['status_msg'].edit_text(
@@ -592,10 +550,12 @@ async def convert_and_upload(client, message, task, inp, out, file_name):
     task['total'] = out_size
     await push_update(task, force=True)
 
-    async def upload_progress(current, total):
-        task['processed'] = current
-        task['total'] = total or out_size
-        await push_update(task)
+    loop = asyncio.get_running_loop()
+
+    def upload_progress(current, total):
+        asyncio.run_coroutine_threadsafe(
+            tg_progress(current, total, task), loop
+        )
 
     await message.reply_audio(
         audio=out,
@@ -694,6 +654,13 @@ async def handle_file(client, message):
         task['total'] = file_size
         retries = 3
         last_err = None
+        loop = asyncio.get_running_loop()
+
+        def download_progress(cur, tot):
+            asyncio.run_coroutine_threadsafe(
+                tg_progress(cur, tot, task), loop
+            )
+
         for attempt in range(1, retries + 1):
             task['processed'] = 0
             if os.path.exists(inp):
@@ -701,7 +668,7 @@ async def handle_file(client, message):
             try:
                 await message.download(
                     file_name=inp,
-                    progress=lambda cur, tot: asyncio.create_task(tg_progress(cur, tot, task))
+                    progress=download_progress
                 )
                 actual_size = os.path.getsize(inp) if os.path.exists(inp) else 0
                 if file_size and actual_size != file_size:
@@ -713,7 +680,7 @@ async def handle_file(client, message):
             except Exception as e:
                 last_err = e
                 if attempt < retries and not task.get('cancelled'):
-                    await asyncio.sleep(2 * attempt)  # backoff before retrying
+                    await asyncio.sleep(2 * attempt)
                     continue
                 raise last_err
 
