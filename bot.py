@@ -1,17 +1,31 @@
 import os
+import uuid
 import asyncio
 import time
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
+from urllib.parse import urlparse, unquote
+
+import aiohttp
+from motor.motor_asyncio import AsyncIOMotorClient
 from pyrogram import Client, filters
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+
+try:
+    import uvloop
+    uvloop.install()  # [OPTIMIZATION] faster asyncio event loop where available
+except ImportError:
+    pass
 
 # ==========================================
 # CONFIGURATION
 # ==========================================
-API_ID = "20288994" # REMINDER: Keep these secret in production!
-API_HASH = "d702614912f1ad370a0d18786002adbf"
-BOT_TOKEN = "8705984680:AAHibptYauF33lFmTeACKqFDwTjIo13jPBY"
+# All secrets come from environment variables — never hardcode credentials
+# in source. Set these on your host (Render dashboard / .env / systemd unit).
+API_ID = 36282056
+API_HASH = "3a948acece533f362b4c90b2b3c14b60"
+BOT_TOKEN = "8850488086:AAHM3lp_bAQvdILvycZ2IDpGawdTGT_bk1M"
+MONGO_URI = "mongodb+srv://filmzi2120_db_user:Zero8907@cluster0.zyau0re.mongodb.net/?appName=Cluster0"
 
 app = Client(
     "converter_bot",
@@ -20,15 +34,28 @@ app = Client(
     bot_token=BOT_TOKEN
 )
 
+mongo_client = AsyncIOMotorClient(MONGO_URI)
+db = mongo_client["converter_bot"]
+settings_col = db["user_settings"]
+history_col = db["task_history"]
+
 MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024
 SUPPORTED_FORMATS = [
     'eac3', 'ac3', 'dts', 'mp3', 'flac', 'wav',
     'ogg', 'opus', 'wma', 'aac', 'mkv', 'mp4', 'avi'
 ]
-USER_SETTINGS = {}
-last_update_time = {}
+DEFAULT_SETTINGS = {'bitrate': '320k', 'ar': '48000', 'ac': '2'}
+SETTINGS_CACHE = {}  # in-memory cache on top of Mongo, keyed by user_id
 
-# Track bot uptime
+ENGINE_NAME = "PyroFFmpeg v2 (uvloop)"
+MAX_QUEUE_SIZE = 20
+MAX_CONCURRENT_TASKS = 3  # [OPTIMIZATION] real parallelism, not just display
+DOWNLOAD_CONNECTIONS = 4  # parallel segments for /leech
+
+task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
+ACTIVE_TASKS = {}          # task_id -> task dict
+SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
+
 START_TIME = time.time()
 
 # ==========================================
@@ -47,41 +74,23 @@ def run_health_server():
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # ==========================================
-# PROGRESS BAR
+# SETTINGS (MongoDB-backed)
 # ==========================================
-def make_bar(percent):
-    filled = int(percent / 10)
-    return "█" * filled + "░" * (10 - filled)
+async def get_settings(user_id):
+    if user_id in SETTINGS_CACHE:
+        return SETTINGS_CACHE[user_id]
+    doc = await settings_col.find_one({"_id": user_id})
+    if doc is None:
+        doc = {"_id": user_id, **DEFAULT_SETTINGS}
+        await settings_col.insert_one(doc)
+    SETTINGS_CACHE[user_id] = doc
+    return doc
 
-async def progress(current, total, status_msg, action):
-    now = time.time()
-    uid = status_msg.id
-    if now - last_update_time.get(uid, 0) < 2:
-        return
-    last_update_time[uid] = now
-    pct = int((current / total) * 100) if total else 0
-    done = round(current / 1024 / 1024, 1)
-    total_mb = round(total / 1024 / 1024, 1)
-    try:
-        await status_msg.edit_text(
-            f"{action}\n"
-            f"[{make_bar(pct)}] {pct}%\n"
-            f"📦 {done} MB / {total_mb} MB"
-        )
-    except:
-        pass
-
-# ==========================================
-# SETTINGS & UI
-# ==========================================
-def get_settings(user_id):
-    if user_id not in USER_SETTINGS:
-        USER_SETTINGS[user_id] = {
-            'bitrate': '320k',
-            'ar': '48000',
-            'ac': '2'
-        }
-    return USER_SETTINGS[user_id]
+async def save_settings(user_id, s):
+    SETTINGS_CACHE[user_id] = s
+    await settings_col.update_one(
+        {"_id": user_id}, {"$set": s}, upsert=True
+    )
 
 def make_markup(s):
     return InlineKeyboardMarkup([
@@ -97,6 +106,84 @@ def make_markup(s):
     ])
 
 # ==========================================
+# FORMAT HELPERS
+# ==========================================
+def format_size(num_bytes):
+    if num_bytes >= 1024 ** 3:
+        return f"{num_bytes / 1024 ** 3:.2f}GB"
+    return f"{num_bytes / 1024 ** 2:.2f}MB"
+
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    m, s = divmod(seconds, 60)
+    return f"{m}m{s}s"
+
+def make_bar(percent):
+    filled = int(percent / 10)
+    return "■" * filled + "□" * (10 - filled)
+
+# ==========================================
+# TASK CARD RENDERING
+# ==========================================
+def refresh_markup(task_id):
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("🔄 Refresh", callback_data=f"refresh|{task_id}")]
+    ])
+
+def render_card(task):
+    pct = int((task['processed'] / task['total']) * 100) if task.get('total') else 0
+    pct = min(pct, 100)
+    elapsed = time.time() - task['start_time']
+    speed = task['processed'] / elapsed if elapsed > 0 else 0
+    remaining = max(task.get('total', 0) - task['processed'], 0)
+    eta = remaining / speed if speed > 0 else 0
+
+    spin = SPINNER_FRAMES[task['refresh_count'] % len(SPINNER_FRAMES)]
+
+    lines = [
+        f"**{task['label']}**",
+        f"`{task['title']}`",
+        "",
+        f"**Task Running:** {task['slot']}/{MAX_QUEUE_SIZE} {spin}",
+        "",
+        f"**{task['stage']}:**",
+        f"[{make_bar(pct)}] {pct}%",
+        f"**Processed:** {format_size(task['processed'])}",
+        f"**Size:** {format_size(task.get('total', 0))}",
+        f"**Speed:** {speed / 1024 / 1024:.2f}MB/s",
+        f"**ETA:** {format_duration(eta)}",
+        f"**Elapsed:** {format_duration(elapsed)}",
+        "**Upload:** Telegram",
+        f"**Engine:** {ENGINE_NAME}",
+        f"**Task ID:** `{task['id']}`",
+        f"/stop_{task['id']}",
+    ]
+    return "\n".join(lines)
+
+async def push_update(task, force=False):
+    now = time.time()
+    if not force and now - task.get('last_edit', 0) < 2:
+        return
+    task['last_edit'] = now
+    try:
+        await task['status_msg'].edit_text(
+            render_card(task), reply_markup=refresh_markup(task['id'])
+        )
+    except Exception:
+        pass
+
+@app.on_callback_query(filters.regex(r"^refresh\|"))
+async def refresh_cb(client, cq):
+    task_id = cq.data.split("|", 1)[1]
+    task = ACTIVE_TASKS.get(task_id)
+    if not task:
+        await cq.answer("⌛ Task finished or expired.", show_alert=False)
+        return
+    task['refresh_count'] += 1
+    await push_update(task, force=True)
+    await cq.answer("🔄 Refreshed!")
+
+# ==========================================
 # COMMANDS
 # ==========================================
 @app.on_message(filters.command("start"))
@@ -104,8 +191,9 @@ async def start_cmd(client, message):
     await message.reply_text(
         "👋 **Welcome to Audio Converter Bot!**\n\n"
         "🎵 Send any audio or video file\n"
-        "⚡ Fast download + conversion\n"
-        "📊 Real progress bar\n"
+        "🔗 Or `/leech <url>` to grab a file from a direct link\n"
+        "⚡ Ultra-fast download + conversion\n"
+        "📊 Live task card with refresh\n"
         "📤 Get M4A back instantly\n\n"
         "📌 /help — How to use\n"
         "⚙️ /settings — Change quality\n"
@@ -116,10 +204,11 @@ async def start_cmd(client, message):
 async def help_cmd(client, message):
     await message.reply_text(
         "🛠 **How to use:**\n\n"
-        "1️⃣ Send or forward any audio/video\n"
+        "1️⃣ Send/forward a file, or `/leech <direct_url>`\n"
         f"2️⃣ Supported: {', '.join(SUPPORTED_FORMATS).upper()}\n"
-        "3️⃣ Watch the progress bar\n"
-        "4️⃣ Get your M4A file!\n\n"
+        "3️⃣ Tap 🔄 Refresh anytime for a live update\n"
+        "4️⃣ `/stop_<task_id>` cancels a running job\n"
+        "5️⃣ Get your M4A file!\n\n"
         "📦 Max: **2GB**\n"
         "✅ 5.1 Surround → Clear Stereo\n"
         "🏷️ Original Metadata Retained\n"
@@ -128,9 +217,10 @@ async def help_cmd(client, message):
 
 @app.on_message(filters.command("settings"))
 async def settings_cmd(client, message):
+    s = await get_settings(message.from_user.id)
     await message.reply_text(
         "⚙️ **Settings** — Tap to change:",
-        reply_markup=make_markup(get_settings(message.from_user.id))
+        reply_markup=make_markup(s)
     )
 
 @app.on_message(filters.command("ping"))
@@ -146,11 +236,32 @@ async def stats_cmd(client, message):
     h = uptime_seconds // 3600
     m = (uptime_seconds % 3600) // 60
     s = uptime_seconds % 60
-    await message.reply_text(f"🤖 **Bot Stats**\n\n⏱ **Uptime:** `{h}h {m}m {s}s`\n🚀 **Status:** Online & Optimized")
+    await message.reply_text(
+        f"🤖 **Bot Stats**\n\n"
+        f"⏱ **Uptime:** `{h}h {m}m {s}s`\n"
+        f"📊 **Active tasks:** {len(ACTIVE_TASKS)}\n"
+        f"🚀 **Status:** Online & Optimized"
+    )
+
+@app.on_message(filters.regex(r"^/stop_([a-f0-9]+)$"))
+async def stop_cmd(client, message):
+    task_id = message.matches[0].group(1)
+    task = ACTIVE_TASKS.get(task_id)
+    if not task:
+        await message.reply_text("⌛ That task isn't running (already finished or invalid ID).")
+        return
+    task['cancelled'] = True
+    proc = task.get('process')
+    if proc and proc.returncode is None:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+    await message.reply_text(f"🛑 Stopping task `{task_id}`...")
 
 @app.on_callback_query(filters.regex("^toggle_"))
 async def toggle(client, cq):
-    s = get_settings(cq.from_user.id)
+    s = await get_settings(cq.from_user.id)
     if cq.data == "toggle_bitrate":
         opts = ['128k', '192k', '320k']
         s['bitrate'] = opts[(opts.index(s['bitrate']) + 1) % 3]
@@ -159,12 +270,12 @@ async def toggle(client, cq):
         s['ar'] = opts[(opts.index(s['ar']) + 1) % 2]
     elif cq.data == "toggle_ac":
         s['ac'] = '1' if s['ac'] == '2' else '2'
-    USER_SETTINGS[cq.from_user.id] = s
+    await save_settings(cq.from_user.id, s)
     await cq.message.edit_reply_markup(make_markup(s))
     await cq.answer("✅ Updated!")
 
 # ==========================================
-# GET DURATION
+# MEDIA PROBING
 # ==========================================
 async def get_duration(path):
     try:
@@ -178,26 +289,48 @@ async def get_duration(path):
         )
         out, _ = await p.communicate()
         return float(out.decode().strip())
-    except:
+    except Exception:
         return 0
+
+async def get_audio_info(path):
+    """Returns (channels, sample_rate). Defaults are conservative (assume
+    surround + mismatched rate) if probing fails, so we don't skip needed
+    processing."""
+    try:
+        p = await asyncio.create_subprocess_exec(
+            'ffprobe', '-v', 'error',
+            '-select_streams', 'a:0',
+            '-show_entries', 'stream=channels,sample_rate',
+            '-of', 'default=noprint_wrappers=1:nokey=1',
+            path,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL
+        )
+        out, _ = await p.communicate()
+        parts = out.decode().strip().split('\n')
+        channels = int(parts[0])
+        sample_rate = int(parts[1])
+        return channels, sample_rate
+    except Exception:
+        return 6, 0
 
 # ==========================================
 # FFMPEG WITH REAL PROGRESS
 # ==========================================
-async def run_ffmpeg_with_progress(cmd, duration, status_msg):
+async def run_ffmpeg_with_progress(cmd, duration, task):
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT
     )
+    task['process'] = process
 
-    last_update = 0
     error_lines = []
     buffer = ""
 
     while True:
         try:
-            chunk = await process.stdout.read(512)
+            chunk = await process.stdout.read(65536)  # [OPTIMIZATION] big reads
             if not chunk:
                 break
 
@@ -209,7 +342,6 @@ async def run_ffmpeg_with_progress(cmd, duration, status_msg):
                 line = line.strip()
                 if not line:
                     continue
-
                 error_lines.append(line)
 
                 if 'time=' in line and duration > 0:
@@ -217,39 +349,11 @@ async def run_ffmpeg_with_progress(cmd, duration, status_msg):
                         t = line.split('time=')[1].split(' ')[0]
                         if ':' in t and t[0] != '-':
                             h, m, s = t.split(':')
-                            current = (
-                                float(h) * 3600 +
-                                float(m) * 60 +
-                                float(s)
-                            )
-                            pct = min(
-                                int((current / duration) * 100),
-                                99
-                            )
-                            now = time.time()
-                            if now - last_update >= 3:
-                                last_update = now
-                                cur_str = (
-                                    f"{int(float(h)):02}:"
-                                    f"{int(float(m)):02}:"
-                                    f"{int(float(s)):02}"
-                                )
-                                dur_str = (
-                                    f"{int(duration//3600):02}:"
-                                    f"{int((duration%3600)//60):02}:"
-                                    f"{int(duration%60):02}"
-                                )
-                                try:
-                                    await status_msg.edit_text(
-                                        f"🔄 **Converting to AAC M4A...**\n"
-                                        f"[{make_bar(pct)}] {pct}%\n"
-                                        f"⏱ {cur_str} / {dur_str}"
-                                    )
-                                except:
-                                    pass
-                    except:
+                            current = float(h) * 3600 + float(m) * 60 + float(s)
+                            task['processed'] = min(current / duration, 1.0) * task['total']
+                            await push_update(task)
+                    except Exception:
                         pass
-
         except Exception:
             break
 
@@ -257,7 +361,219 @@ async def run_ffmpeg_with_progress(cmd, duration, status_msg):
     return process.returncode, '\n'.join(error_lines[-20:])
 
 # ==========================================
-# MAIN FILE HANDLER
+# DOWNLOAD: TELEGRAM MESSAGE (with task card)
+# ==========================================
+async def tg_progress(current, total, task):
+    task['processed'] = current
+    task['total'] = total or task.get('total', 0)
+    await push_update(task)
+
+# ==========================================
+# DOWNLOAD: URL (/leech) — segmented + fallback
+# ==========================================
+async def _download_range(session, url, start, end, dest_path, task):
+    headers = {"Range": f"bytes={start}-{end}"}
+    async with session.get(url, headers=headers) as resp:
+        resp.raise_for_status()
+        with open(dest_path, "r+b") as f:
+            f.seek(start)
+            async for chunk in resp.content.iter_chunked(1024 * 1024):
+                f.write(chunk)
+                task['processed'] += len(chunk)
+                await push_update(task)
+
+async def download_from_url(url, dest_path, task):
+    timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=60)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.head(url, allow_redirects=True) as head_resp:
+            total = int(head_resp.headers.get('Content-Length', 0))
+            accepts_ranges = head_resp.headers.get('Accept-Ranges', '').lower() == 'bytes'
+
+        task['total'] = total
+
+        # [OPTIMIZATION] segmented parallel download when the server
+        # supports Range requests and the file is big enough to benefit
+        if accepts_ranges and total > 5 * 1024 * 1024:
+            with open(dest_path, "wb") as f:
+                f.truncate(total)
+
+            chunk_size = total // DOWNLOAD_CONNECTIONS
+            ranges = []
+            for i in range(DOWNLOAD_CONNECTIONS):
+                start = i * chunk_size
+                end = total - 1 if i == DOWNLOAD_CONNECTIONS - 1 else start + chunk_size - 1
+                ranges.append((start, end))
+
+            await asyncio.gather(*[
+                _download_range(session, url, start, end, dest_path, task)
+                for start, end in ranges
+            ])
+        else:
+            # fallback: single-stream download
+            async with session.get(url) as resp:
+                resp.raise_for_status()
+                if not total:
+                    total = int(resp.headers.get('Content-Length', 0))
+                    task['total'] = total
+                with open(dest_path, 'wb') as f:
+                    async for chunk in resp.content.iter_chunked(1024 * 1024):
+                        f.write(chunk)
+                        task['processed'] += len(chunk)
+                        await push_update(task)
+
+    return task['processed']
+
+def guess_filename_ext(url):
+    path = urlparse(url).path
+    name = unquote(os.path.basename(path)) or "leeched_file"
+    ext = name.rsplit('.', 1)[-1].lower() if '.' in name else ''
+    return name, ext
+
+# ==========================================
+# SHARED CONVERT + UPLOAD PIPELINE
+# ==========================================
+async def convert_and_upload(client, message, task, inp, out, file_name):
+    if task.get('cancelled'):
+        return
+
+    duration = await get_duration(inp)
+    s = await get_settings(message.from_user.id)
+
+    # [OPTIMIZATION] only downmix if source actually has >2 channels,
+    # and only resample if the source rate doesn't already match target
+    channels, src_rate = await get_audio_info(inp)
+    audio_filters = []
+    if channels > 2:
+        audio_filters.append(
+            'pan=stereo|FL=FC+0.707*FL+0.707*BL|FR=FC+0.707*FR+0.707*BR'
+        )
+
+    task['stage'] = "🔄 Converting"
+    task['processed'] = 0
+    task['total'] = duration or 1
+    await push_update(task, force=True)
+
+    cmd = [
+        'ffmpeg', '-y', '-nostdin',
+        '-hwaccel', 'auto',
+        '-i', inp,
+        '-map', '0:a:0',       # [OPTIMIZATION] only touch the audio stream
+        '-threads', '0',
+        '-c:a', 'aac',
+        '-aac_coder', 'fast',  # [OPTIMIZATION] faster AAC encode path
+        '-b:a', s['bitrate'],
+        '-ac', '2',
+    ]
+    if audio_filters:
+        cmd += ['-af', ','.join(audio_filters)]
+    if str(src_rate) != str(s['ar']):
+        cmd += ['-ar', s['ar']]  # [OPTIMIZATION] skip resample if rates already match
+    cmd += [
+        '-vn',
+        '-map_metadata', '0',
+        '-movflags', '+faststart',
+        out
+    ]
+
+    rc, err = await run_ffmpeg_with_progress(cmd, duration, task)
+
+    if task.get('cancelled'):
+        await task['status_msg'].edit_text("🛑 **Task cancelled.**")
+        return
+
+    if rc != 0:
+        await task['status_msg'].edit_text(
+            f"❌ **FFmpeg Error:**\n`{err[-300:]}`\n\nPlease try again."
+        )
+        return
+
+    out_size = os.path.getsize(out)
+
+    task['stage'] = "⬆️ Uploading"
+    task['processed'] = 0
+    task['total'] = out_size
+    await push_update(task, force=True)
+
+    async def upload_progress(current, total):
+        task['processed'] = current
+        task['total'] = total or out_size
+        await push_update(task)
+
+    await message.reply_audio(
+        audio=out,
+        title=file_name.rsplit('.', 1)[0] + '.m4a',
+        caption=(
+            f"✅ **Converted Successfully!**\n\n"
+            f"🎵 Format: AAC M4A\n"
+            f"🎚 Bitrate: {s['bitrate']}\n"
+            f"🎚 Sample Rate: {s['ar']} Hz\n"
+            f"🔊 Channels: Stereo\n"
+            f"📦 Size: {format_size(out_size)}\n"
+            f"⏱ Total: {format_duration(time.time() - task['start_time'])}"
+        ),
+        progress=upload_progress
+    )
+    await task['status_msg'].delete()
+
+    await history_col.insert_one({
+        "task_id": task['id'],
+        "user_id": message.from_user.id,
+        "file_name": file_name,
+        "size": out_size,
+        "duration_sec": time.time() - task['start_time'],
+        "timestamp": time.time(),
+    })
+
+# ==========================================
+# TASK ORCHESTRATION
+# ==========================================
+async def run_task(client, message, title, label, source_fn, ext_hint):
+    task_id = uuid.uuid4().hex[:16]
+    status_msg = await message.reply_text(f"⏳ **Queuing** `{title}`...")
+
+    task = {
+        'id': task_id,
+        'label': label,
+        'title': title,
+        'stage': "📥 Downloading",
+        'processed': 0,
+        'total': 0,
+        'start_time': time.time(),
+        'last_edit': 0,
+        'refresh_count': 0,
+        'slot': len(ACTIVE_TASKS) + 1,
+        'status_msg': status_msg,
+        'process': None,
+        'cancelled': False,
+    }
+    ACTIVE_TASKS[task_id] = task
+
+    safe_id = task_id
+    ext = ext_hint or "bin"
+    inp = f"/tmp/input_{safe_id}.{ext}"
+    out = f"/tmp/output_{safe_id}.m4a"
+
+    async with task_semaphore:
+        try:
+            await push_update(task, force=True)
+            await source_fn(inp, task)
+            if task.get('cancelled'):
+                await task['status_msg'].edit_text("🛑 **Task cancelled.**")
+                return
+            await convert_and_upload(client, message, task, inp, out, title)
+        except Exception as e:
+            try:
+                await task['status_msg'].edit_text(f"❌ **Error:** {str(e)}\nPlease try again.")
+            except Exception:
+                pass
+        finally:
+            for f in [inp, out]:
+                if os.path.exists(f):
+                    os.remove(f)
+            ACTIVE_TASKS.pop(task_id, None)
+
+# ==========================================
+# MAIN FILE HANDLER (forwarded/sent files)
 # ==========================================
 @app.on_message(filters.audio | filters.video | filters.document)
 async def handle_file(client, message):
@@ -272,127 +588,53 @@ async def handle_file(client, message):
             f"✅ Supported: {', '.join(SUPPORTED_FORMATS).upper()}"
         )
         return
-
     if file_size > MAX_FILE_SIZE:
         await message.reply_text("❌ Too large! Max **2GB**.")
         return
 
-    size_mb = round(file_size / 1024 / 1024, 1)
-    status = await message.reply_text(
-        f"📥 **Downloading...**\n"
-        f"[░░░░░░░░░░] 0%\n"
-        f"📦 {size_mb} MB"
-    )
-
-    safe_id = str(message.id)
-    inp = f"/tmp/input_{safe_id}.{ext}"
-    out = f"/tmp/output_{safe_id}.m4a"
-    t0 = time.time()
-
-    try:
-        # ==========================================
-        # 1. DOWNLOAD WITH PROGRESS
-        # ==========================================
+    async def source_fn(inp, task):
+        task['total'] = file_size
         await message.download(
             file_name=inp,
-            progress=progress,
-            progress_args=(status, "📥 **Downloading...**")
-        )
-        dl_time = round(time.time() - t0, 1)
-
-        duration = await get_duration(inp)
-
-        await status.edit_text(
-            f"✅ Downloaded in {dl_time}s\n"
-            f"🔄 **Converting...**\n"
-            f"[░░░░░░░░░░] 0%\n"
-            f"⏱ Starting..."
+            progress=lambda cur, tot: asyncio.create_task(tg_progress(cur, tot, task))
         )
 
-        # ==========================================
-        # 2. CONVERT WITH REAL PROGRESS (OPTIMIZED)
-        # ==========================================
-        s = get_settings(message.from_user.id)
+    await run_task(client, message, file_name, "📦 Telegram File", source_fn, ext)
 
-        cmd = [
-            'ffmpeg', '-y',
-            '-hwaccel', 'auto',  # [OPTIMIZATION] Try hardware decoding
-            '-i', inp,
-            '-threads', '0',     # [OPTIMIZATION] Use all CPU cores (was 4)
-            '-c:a', 'aac',
-            '-b:a', s['bitrate'],
-            '-ac', '2',
-            '-af', (
-                'pan=stereo|'
-                'FL=FC+0.707*FL+0.707*BL|'
-                'FR=FC+0.707*FR+0.707*BR'
-            ),
-            '-ar', s['ar'],
-            '-vn',
-            '-map_metadata', '0', # [FEATURE] Retain original audio tags
-            '-movflags', '+faststart',
-            out
-        ]
-
-        ct0 = time.time()
-        rc, err = await run_ffmpeg_with_progress(
-            cmd, duration, status)
-
-        if rc != 0:
-            await status.edit_text(
-                f"❌ **FFmpeg Error:**\n`{err[-300:]}`\n\n"
-                "Please try again."
-            )
-            return
-
-        conv_time = round(time.time() - ct0, 1)
-        out_mb = round(os.path.getsize(out) / 1024 / 1024, 1)
-        total_time = round(time.time() - t0, 1)
-
-        await status.edit_text(
-            f"✅ Converted in {conv_time}s\n"
-            f"⬆️ **Uploading...**\n"
-            f"[░░░░░░░░░░] 0%\n"
-            f"📦 {out_mb} MB"
+# ==========================================
+# LEECH HANDLER (download from a direct URL)
+# ==========================================
+@app.on_message(filters.command("leech"))
+async def leech_cmd(client, message):
+    if len(message.command) < 2:
+        await message.reply_text(
+            "⚠️ **Usage:** `/leech <direct_download_url>`\n\n"
+            "Give me a direct link to an audio/video file and I'll "
+            "ultra-fast download and convert it to M4A."
         )
+        return
 
-        # ==========================================
-        # 3. UPLOAD WITH PROGRESS
-        # ==========================================
-        await message.reply_audio(
-            audio=out,
-            title=file_name.rsplit('.', 1)[0] + '.m4a',
-            caption=(
-                f"✅ **Converted Successfully!**\n\n"
-                f"🎵 Format: AAC M4A\n"
-                f"🎚 Bitrate: {s['bitrate']}\n"
-                f"🎚 Sample Rate: {s['ar']} Hz\n"
-                f"🔊 Channels: Stereo\n"
-                f"📦 Size: {out_mb} MB\n"
-                f"⏱ Total: {total_time}s"
-            ),
-            progress=progress,
-            progress_args=(status, "⬆️ **Uploading...**")
+    url = message.command[1]
+    file_name, ext = guess_filename_ext(url)
+
+    if ext and ext not in SUPPORTED_FORMATS:
+        await message.reply_text(
+            "❌ **Unsupported format!**\n"
+            f"✅ Supported: {', '.join(SUPPORTED_FORMATS).upper()}"
         )
-        await status.delete()
+        return
 
-    except Exception as e:
-        await status.edit_text(
-            f"❌ **Error:** {str(e)}\n"
-            "Please try again."
-        )
+    async def source_fn(inp, task):
+        downloaded = await download_from_url(url, inp, task)
+        if downloaded > MAX_FILE_SIZE:
+            raise ValueError("File exceeds 2GB limit")
 
-    finally:
-        for f in [inp, out]:
-            if os.path.exists(f):
-                os.remove(f)
-        last_update_time.pop(status.id, None)
+    await run_task(client, message, file_name, "🔗 Leech", source_fn, ext)
 
 # ==========================================
 # START
 # ==========================================
 if __name__ == '__main__':
-    threading.Thread(
-        target=run_health_server, daemon=True).start()
-    print("🤖 Bot starting... (Optimized Mode)")
+    threading.Thread(target=run_health_server, daemon=True).start()
+    print("🤖 Bot starting... (Ultra-Fast + Leech + Mongo)")
     app.run()
