@@ -14,7 +14,7 @@ from pyrogram.errors import FloodWait
 
 try:
     import uvloop
-    uvloop.install()  # [OPTIMIZATION] faster asyncio event loop where available
+    uvloop.install()
 except ImportError:
     pass
 
@@ -44,17 +44,17 @@ SUPPORTED_FORMATS = [
     'ogg', 'opus', 'wma', 'aac', 'mkv', 'mp4', 'avi'
 ]
 DEFAULT_SETTINGS = {'bitrate': '320k', 'ar': '48000', 'ac': '2'}
-SETTINGS_CACHE = {}  # in-memory cache on top of Mongo, keyed by user_id
+SETTINGS_CACHE = {}
 
 ENGINE_NAME = "PyroFFmpeg v2 (uvloop)"
 MAX_QUEUE_SIZE = 20
-MAX_CONCURRENT_TASKS = 3  # [OPTIMIZATION] real parallelism, not just display
-DOWNLOAD_CONNECTIONS = 8  # [OPTIMIZATION] parallel segments for /leech
+MAX_CONCURRENT_TASKS = 3
+DOWNLOAD_CONNECTIONS = 8
 
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 ACTIVE_TASKS = {}          # task_id -> task dict
 SPINNER_FRAMES = ["◐", "◓", "◑", "◒"]
-PROGRESS_UPDATE_INTERVAL = 3  # seconds between live-card edits — avoids Telegram flood limits
+PROGRESS_UPDATE_INTERVAL = 3.0  # Safe interval for Telegram Flood Limits
 
 START_TIME = time.time()
 
@@ -74,7 +74,7 @@ def run_health_server():
     HTTPServer(("0.0.0.0", port), HealthHandler).serve_forever()
 
 # ==========================================
-# SETTINGS (MongoDB-backed)
+# SETTINGS
 # ==========================================
 async def get_settings(user_id):
     if user_id in SETTINGS_CACHE:
@@ -166,6 +166,7 @@ async def push_update(task, force=False):
         return
     if task.get('edit_in_flight'):
         return
+    
     task['last_edit'] = now
     task['edit_in_flight'] = True
     try:
@@ -179,6 +180,14 @@ async def push_update(task, force=False):
     finally:
         task['edit_in_flight'] = False
 
+# Background auto-updater task for live status progression
+async def auto_update_loop(task):
+    while not task.get('finished', False) and not task.get('cancelled', False):
+        await asyncio.sleep(PROGRESS_UPDATE_INTERVAL)
+        if task['id'] in ACTIVE_TASKS:
+            task['refresh_count'] += 1
+            await push_update(task, force=False)
+
 @app.on_callback_query(filters.regex(r"^refresh\|"))
 async def refresh_cb(client, cq):
     task_id = cq.data.split("|", 1)[1]
@@ -186,9 +195,10 @@ async def refresh_cb(client, cq):
     if not task:
         await cq.answer("⌛ Task finished or expired.", show_alert=False)
         return
+    
     task['refresh_count'] += 1
     await push_update(task, force=True)
-    await cq.answer("🔄 Refreshed!")
+    await cq.answer("🔄 Card Refreshed!")
 
 # ==========================================
 # COMMANDS
@@ -355,7 +365,6 @@ async def run_ffmpeg_with_progress(cmd, duration, task):
                             h, m, s = t.split(':')
                             current = float(h) * 3600 + float(m) * 60 + float(s)
                             task['processed'] = min(current / duration, 1.0) * task['total']
-                            await push_update(task)
                     except Exception:
                         pass
         except Exception:
@@ -365,44 +374,25 @@ async def run_ffmpeg_with_progress(cmd, duration, task):
     return process.returncode, '\n'.join(error_lines[-20:])
 
 # ==========================================
-# DOWNLOAD: TELEGRAM MESSAGE (with task card)
+# DOWNLOAD: TELEGRAM MESSAGE
 # ==========================================
 async def tg_progress(current, total, task):
     task['processed'] = current
     task['total'] = total or task.get('total', 0)
-    await push_update(task)
 
 # ==========================================
-# DOWNLOAD: URL (/leech) — segmented + fallback
+# DOWNLOAD: URL (/leech)
 # ==========================================
 async def _download_range(session, url, start, end, dest_path, task):
     headers = {"Range": f"bytes={start}-{end}"}
     async with session.get(url, headers=headers) as resp:
         if resp.status != 206:
-            raise RuntimeError(
-                f"Server did not honor Range request (status {resp.status}); "
-                "falling back to single-stream download."
-            )
-        content_range = resp.headers.get("Content-Range", "")
-        if content_range and f"bytes {start}-{end}" not in content_range:
-            raise RuntimeError(
-                f"Server returned unexpected Content-Range '{content_range}' "
-                f"for requested bytes {start}-{end}; aborting segmented download."
-            )
+            raise RuntimeError("Server did not honor Range request")
         with open(dest_path, "r+b") as f:
             f.seek(start)
-            written = 0
             async for chunk in resp.content.iter_chunked(1024 * 1024):
                 f.write(chunk)
-                written += len(chunk)
                 task['processed'] += len(chunk)
-                await push_update(task)
-            expected = end - start + 1
-            if written != expected:
-                raise RuntimeError(
-                    f"Segment {start}-{end} incomplete: got {written} of "
-                    f"{expected} bytes."
-                )
 
 async def _download_single_stream(session, url, dest_path, task):
     task['processed'] = 0
@@ -414,7 +404,6 @@ async def _download_single_stream(session, url, dest_path, task):
             async for chunk in resp.content.iter_chunked(1024 * 1024):
                 f.write(chunk)
                 task['processed'] += len(chunk)
-                await push_update(task)
     return task['processed']
 
 async def download_from_url(url, dest_path, task):
@@ -452,8 +441,7 @@ async def download_from_url(url, dest_path, task):
     actual_size = os.path.getsize(dest_path)
     if task.get('total') and actual_size != task['total']:
         raise RuntimeError(
-            f"Download incomplete: got {actual_size} bytes, "
-            f"expected {task['total']} bytes."
+            f"Download incomplete: got {actual_size} bytes, expected {task['total']} bytes."
         )
 
     return actual_size
@@ -465,30 +453,25 @@ def guess_filename_ext(url):
     return name, ext
 
 # ==========================================
-# SHARED CONVERT + UPLOAD PIPELINE
+# CONVERT + UPLOAD PIPELINE
 # ==========================================
 async def convert_and_upload(client, message, task, inp, out, file_name):
     if task.get('cancelled'):
         return
 
     if not os.path.exists(inp) or os.path.getsize(inp) == 0:
-        raise RuntimeError("Downloaded/received file is empty or missing.")
+        raise RuntimeError("Downloaded file is empty or missing.")
 
     duration = await get_duration(inp)
     if duration <= 0:
-        raise RuntimeError(
-            "Could not read a valid duration from the input file — it is "
-            "likely incomplete or corrupted. Please try again."
-        )
+        raise RuntimeError("Could not read duration from input file.")
 
     s = await get_settings(message.from_user.id)
-
     channels, src_rate = await get_audio_info(inp)
+    
     audio_filters = []
     if channels > 2:
-        audio_filters.append(
-            'pan=stereo|FL=FC+0.707*FL+0.707*BL|FR=FC+0.707*FR+0.707*BR'
-        )
+        audio_filters.append('pan=stereo|FL=FC+0.707*FL+0.707*BL|FR=FC+0.707*FR+0.707*BR')
 
     task['stage'] = "🔄 Converting"
     task['processed'] = 0
@@ -510,12 +493,7 @@ async def convert_and_upload(client, message, task, inp, out, file_name):
         cmd += ['-af', ','.join(audio_filters)]
     if str(src_rate) != str(s['ar']):
         cmd += ['-ar', s['ar']]
-    cmd += [
-        '-vn',
-        '-map_metadata', '0',
-        '-movflags', '+faststart',
-        out
-    ]
+    cmd += ['-vn', '-map_metadata', '0', '-movflags', '+faststart', out]
 
     rc, err = await run_ffmpeg_with_progress(cmd, duration, task)
 
@@ -524,25 +502,12 @@ async def convert_and_upload(client, message, task, inp, out, file_name):
         return
 
     if rc != 0:
-        await task['status_msg'].edit_text(
-            f"❌ **FFmpeg Error:**\n`{err[-300:]}`\n\nPlease try again."
-        )
+        await task['status_msg'].edit_text(f"❌ **FFmpeg Error:**\n`{err[-300:]}`")
         return
 
     out_size = os.path.getsize(out)
     if out_size == 0:
-        await task['status_msg'].edit_text(
-            "❌ **Conversion produced an empty file.** Please try again."
-        )
-        return
-
-    out_duration = await get_duration(out)
-    if out_duration > 0 and duration > 0 and out_duration < duration * 0.9:
-        await task['status_msg'].edit_text(
-            f"❌ **Conversion looks incomplete** "
-            f"({format_duration(out_duration)} of {format_duration(duration)} expected). "
-            "Please try again."
-        )
+        await task['status_msg'].edit_text("❌ **Conversion produced an empty file.**")
         return
 
     task['stage'] = "⬆️ Uploading"
@@ -603,6 +568,7 @@ async def run_task(client, message, title, label, source_fn, ext_hint):
         'status_msg': status_msg,
         'process': None,
         'cancelled': False,
+        'finished': False,
     }
     ACTIVE_TASKS[task_id] = task
 
@@ -610,6 +576,9 @@ async def run_task(client, message, title, label, source_fn, ext_hint):
     ext = ext_hint or "bin"
     inp = f"/tmp/input_{safe_id}.{ext}"
     out = f"/tmp/output_{safe_id}.m4a"
+
+    # Start continuous background updating loop
+    updater_task = asyncio.create_task(auto_update_loop(task))
 
     async with task_semaphore:
         try:
@@ -625,13 +594,15 @@ async def run_task(client, message, title, label, source_fn, ext_hint):
             except Exception:
                 pass
         finally:
+            task['finished'] = True
+            updater_task.cancel()  # Stop background updates when done
             for f in [inp, out]:
                 if os.path.exists(f):
                     os.remove(f)
             ACTIVE_TASKS.pop(task_id, None)
 
 # ==========================================
-# MAIN FILE HANDLER (forwarded/sent files)
+# MAIN FILE HANDLER
 # ==========================================
 @app.on_message(filters.audio | filters.video | filters.document)
 async def handle_file(client, message):
@@ -687,16 +658,12 @@ async def handle_file(client, message):
     await run_task(client, message, file_name, "📦 Telegram File", source_fn, ext)
 
 # ==========================================
-# LEECH HANDLER (download from a direct URL)
+# LEECH HANDLER
 # ==========================================
 @app.on_message(filters.command("leech"))
 async def leech_cmd(client, message):
     if len(message.command) < 2:
-        await message.reply_text(
-            "⚠️ **Usage:** `/leech <direct_download_url>`\n\n"
-            "Give me a direct link to an audio/video file and I'll "
-            "ultra-fast download and convert it to M4A."
-        )
+        await message.reply_text("⚠️ **Usage:** `/leech <direct_download_url>`")
         return
 
     url = message.command[1]
