@@ -50,7 +50,7 @@ SETTINGS_CACHE = {}  # in-memory cache on top of Mongo, keyed by user_id
 ENGINE_NAME = "PyroFFmpeg v2 (uvloop)"
 MAX_QUEUE_SIZE = 20
 MAX_CONCURRENT_TASKS = 3  # [OPTIMIZATION] real parallelism, not just display
-DOWNLOAD_CONNECTIONS = 4  # parallel segments for /leech
+DOWNLOAD_CONNECTIONS = 8  # [OPTIMIZATION] parallel segments for /leech
 
 task_semaphore = asyncio.Semaphore(MAX_CONCURRENT_TASKS)
 ACTIVE_TASKS = {}          # task_id -> task dict
@@ -384,7 +384,10 @@ async def _download_range(session, url, start, end, dest_path, task):
 
 async def download_from_url(url, dest_path, task):
     timeout = aiohttp.ClientTimeout(total=None, sock_connect=30, sock_read=60)
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    # [OPTIMIZATION] connector limit must cover all parallel segments,
+    # otherwise aiohttp silently queues them and download stops being parallel
+    connector = aiohttp.TCPConnector(limit=DOWNLOAD_CONNECTIONS + 2, ttl_dns_cache=300)
+    async with aiohttp.ClientSession(timeout=timeout, connector=connector) as session:
         async with session.head(url, allow_redirects=True) as head_resp:
             total = int(head_resp.headers.get('Content-Length', 0))
             accepts_ranges = head_resp.headers.get('Accept-Ranges', '').lower() == 'bytes'
