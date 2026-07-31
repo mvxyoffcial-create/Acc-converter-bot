@@ -25,7 +25,7 @@ except ImportError:
 API_ID = 36282056
 API_HASH = "3a948acece533f362b4c90b2b3c14b60"
 BOT_TOKEN = "8850488086:AAHM3lp_bAQvdILvycZ2IDpGawdTGT_bk1M"
-MONGO_URI = "mongodb+srv://filmzi2120_db_user:Zero8907@cluster0.zyau0re.mongodb.net/?appName=Cluster0"
+MONGO_URI = "mongodb+srv://filmzi2120_db_user:venura8907@cluster0.zyau0re.mongodb.net/?appName=Cluster0"
 
 app = Client(
     "converter_bot",
