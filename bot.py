@@ -1,4 +1,4 @@
-import os
+Import os
 import uuid
 import asyncio
 import time
@@ -227,7 +227,7 @@ async def help_cmd(client, message):
         "4️⃣ `/stop_<task_id>` cancels a running job\n"
         "5️⃣ Get your M4A file!\n\n"
         "📦 Max: **2GB**\n"
-        "✅ 5.1 Surround → Clear Stereo / Mono\n"
+        "✅ 5.1 Surround → Clear Stereo\n"
         "🏷️ Original Metadata Retained\n"
         "⚙️ /settings to adjust quality"
     )
@@ -469,14 +469,9 @@ async def convert_and_upload(client, message, task, inp, out, file_name):
     s = await get_settings(message.from_user.id)
     channels, src_rate = await get_audio_info(inp)
     
-    # --- FIX: Use the actual chosen channel count from settings ---
     audio_filters = []
-    if channels > 2 and s['ac'] == '2':
-        # Down-mix multichannel to stereo
+    if channels > 2:
         audio_filters.append('pan=stereo|FL=FC+0.707*FL+0.707*BL|FR=FC+0.707*FR+0.707*BR')
-    elif channels > 1 and s['ac'] == '1':
-        # Down-mix multichannel to mono
-        audio_filters.append('pan=mono|c0=FC+0.707*FL+0.707*FR+0.707*BL+0.707*BR')
 
     task['stage'] = "🔄 Converting"
     task['processed'] = 0
@@ -492,7 +487,7 @@ async def convert_and_upload(client, message, task, inp, out, file_name):
         '-c:a', 'aac',
         '-aac_coder', 'fast',
         '-b:a', s['bitrate'],
-        '-ac', s['ac'],                # <--- now reads from settings
+        '-ac', '2',
     ]
     if audio_filters:
         cmd += ['-af', ','.join(audio_filters)]
@@ -535,7 +530,7 @@ async def convert_and_upload(client, message, task, inp, out, file_name):
             f"🎵 Format: AAC M4A\n"
             f"🎚 Bitrate: {s['bitrate']}\n"
             f"🎚 Sample Rate: {s['ar']} Hz\n"
-            f"🔊 Channels: {'Stereo' if s['ac']=='2' else 'Mono'}\n"
+            f"🔊 Channels: Stereo\n"
             f"📦 Size: {format_size(out_size)}\n"
             f"⏱ Total: {format_duration(time.time() - task['start_time'])}"
         ),
